@@ -3,6 +3,7 @@
 
 # >>> ENV
 import ctypes
+import json
 import locale
 import os
 import re
@@ -14,12 +15,13 @@ from subprocess import CalledProcessError, run, PIPE, Popen
 INSTALL_FAILED = False
 # Revisions of tensorflow-gpu and cuda/cudnn requirements
 TENSORFLOW_REQUIREMENTS = {"==1.12.0": ["9.0", "7.2"],
-                           ">=1.13.1,<1.14": ["10.0", "7.4"]}  # TF 1.14+ Not currently supported
+                           ">=1.13.1,<1.16": ["10.0", "7.4"]}  # TF 2.0 Not currently supported
 # Mapping of Python packages to their conda names if different from pypi or in non-default channel
-CONDA_MAPPING = {"opencv-python": ("opencv", "conda-forge"),
-                 "fastcluster": ("fastcluster", "conda-forge"),
-                 "toposort": ("toposort", "conda-forge"),
-                 "imageio-ffmpeg": ("imageio-ffmpeg", "conda-forge")}
+CONDA_MAPPING = {
+    # "opencv-python": ("opencv", "conda-forge"),  # Periodic issues with conda-forge opencv
+    "fastcluster": ("fastcluster", "conda-forge"),
+    "toposort": ("toposort", "conda-forge"),
+    "imageio-ffmpeg": ("imageio-ffmpeg", "conda-forge")}
 
 
 class Environment():
@@ -28,7 +30,6 @@ class Environment():
         """ logger will override built in Output() function if passed in
             updater indicates that this is being run from update_deps.py
             so certain steps can be skipped/output limited """
-        self.macos_required_packages = ["pynvx==0.0.4"]
         self.conda_required_packages = [("tk", )]
         self.output = logger if logger else Output()
         self.updater = updater
@@ -71,14 +72,10 @@ class Environment():
         return platform.python_version(), platform.architecture()[0]
 
     @property
-    def is_macos(self):
-        """ Check whether MacOS """
-        return bool(platform.system() == "Darwin")
-
-    @property
     def is_conda(self):
         """ Check whether using Conda """
-        return bool("conda" in sys.version.lower())
+        return ("conda" in sys.version.lower() or
+                os.path.exists(os.path.join(sys.prefix, 'conda-meta')))
 
     @property
     def ld_library_path(self):
@@ -136,7 +133,7 @@ class Environment():
         if self.is_admin:
             self.output.info("Running as Root/Admin")
         else:
-            self.output.warning("Running without root/admin privileges")
+            self.output.info("Running without root/admin privileges")
 
     def check_system(self):
         """ Check the system """
@@ -224,7 +221,7 @@ class Environment():
             return
 
         if not self.enable_cuda:
-            self.required_packages.append("tensorflow==1.13.1")
+            self.required_packages.append("tensorflow==1.15.0")
             return
 
         tf_ver = None
@@ -270,14 +267,29 @@ class Environment():
     def update_tf_dep_conda(self):
         """ Update Conda TF Dependency """
         if not self.enable_cuda:
-            self.required_packages.append("tensorflow==1.13.1")
+            self.required_packages.append("tensorflow==1.15.0")
         else:
-            self.required_packages.append("tensorflow-gpu==1.13.1")
+            self.required_packages.append("tensorflow-gpu==1.15.0")
 
     def update_amd_dep(self):
         """ Update amd dependency for AMD cards """
         if self.enable_amd:
-            self.required_packages.append("plaidml-keras")
+            self.required_packages.append("plaidml-keras==0.6.4")
+
+    def set_config(self):
+        """ Set the backend in the faceswap config file """
+        if self.enable_amd:
+            backend = "amd"
+        elif self.enable_cuda:
+            backend = "nvidia"
+        else:
+            backend = "cpu"
+        config = {"backend": backend}
+        pypath = os.path.dirname(os.path.realpath(__file__))
+        config_file = os.path.join(pypath, "config", ".faceswap")
+        with open(config_file, "w") as cnf:
+            json.dump(config, cnf)
+        self.output.info("Faceswap config written to: {}".format(config_file))
 
 
 class Output():
@@ -347,6 +359,7 @@ class Checks():
             self.docker_confirm()
         if self.env.enable_docker:
             self.docker_tips()
+            self.env.set_config()
             exit(0)
 
     # Check for CUDA and cuDNN
@@ -522,6 +535,8 @@ class Checks():
         """ Return the checkfile locations for linux """
         chk = os.popen("ldconfig -p | grep -P \"libcudnn.so.\\d+\" | head -n 1").read()
         chk = chk.strip().replace("libcudnn.so.", "")
+        if not chk:
+            return list()
         cudnn_vers = chk[0]
         cudnn_path = chk[chk.find("=>") + 3:chk.find("libcudnn") - 1]
         cudnn_path = cudnn_path.replace("lib", "include")
@@ -568,8 +583,6 @@ class Install():
 
     def check_missing_dep(self):
         """ Check for missing dependencies """
-        if self.env.enable_cuda and self.env.is_macos:
-            self.env.required_packages.extend(self.env.macos_required_packages)
         for pkg in self.env.required_packages:
             pkg = self.check_os_requirements(pkg)
             if pkg is None:
@@ -627,7 +640,7 @@ class Install():
         """ Install required pip packages """
         self.output.info("Installing Required Python Packages. This may take some time...")
         for pkg in self.env.missing_packages:
-            if self.env.is_conda:
+            if self.env.is_conda and not pkg.startswith("git"):
                 verbose = pkg.startswith("tensorflow") or self.env.updater
                 pkg = CONDA_MAPPING.get(pkg, (pkg, None))
                 channel = None if len(pkg) != 2 else pkg[1]
@@ -790,6 +803,7 @@ class Tips():
 if __name__ == "__main__":
     ENV = Environment()
     Checks(ENV)
+    ENV.set_config()
     if INSTALL_FAILED:
         exit(1)
     Install(ENV)
